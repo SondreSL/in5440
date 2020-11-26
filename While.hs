@@ -7,7 +7,8 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 
 import qualified Data.IntMap.Strict as Map
-import qualified Data.IntSet as IntSet
+
+-- import qualified Data.IntSet as IntSet
 import qualified Data.Set as Set
 import Relude
 
@@ -159,7 +160,7 @@ class MonotoneFramework a where
   initial :: CFG -> Set a
   bottom :: Set a
   transfer :: CFG -> Set a -> Label -> Set a
-  test :: Set a -> Set a -> Bool
+  latticeLess :: Set a -> Set a -> Bool
   latticeJoin :: Set a -> Set a -> Set a
 
 type RDEntry = (Identifier, Maybe Label)
@@ -174,13 +175,13 @@ rdTransfer cfg old l = gen <> (old Set.\\ kill)
     killSet = defines block
 
 data Dir = Forward | Backward
-  deriving Show
+  deriving (Show)
 
 instance MonotoneFramework RDEntry where
   initialMap cfg = Map.fromList [(0, initial cfg)]
   initial = Set.map (,Nothing) . identifiers
   bottom = Set.empty
-  test = Set.isSubsetOf
+  latticeLess = Set.isSubsetOf
   latticeJoin = Set.union
   transfer = rdTransfer
 
@@ -195,12 +196,11 @@ worklist cfg = go (allEdges cfg) (initialMap cfg)
         ana_post = Map.lookup l' output ?: bottom
         new = transfer cfg ana_pre l
         newset = latticeJoin new ana_post
-     in if test new ana_post
+        output' = Map.insert l' newset output
+        edges = filter ((== l') . fst) $ allEdges cfg
+     in if latticeLess new ana_post
           then go rest output
-          else
-            let output' = Map.insert l' newset output
-                edges = filter ((== l') . fst) $ allEdges cfg
-             in go (edges ++ rest) output'
+          else go (edges ++ rest) output'
 
 --- Main ---
 
