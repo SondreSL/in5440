@@ -1,19 +1,17 @@
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
-import Debug.Trace
-
-import qualified Data.Text as T
-import           Data.Text   ( Text )
 import qualified Data.IntMap.Strict as Map
+import qualified Data.IntSet as IntSet
 import qualified Data.Set as Set
 import Relude
-import Text.Pretty.Simple (pPrint)
+
+-- import Text.Pretty.Simple (pPrint)
 
 --- AST ---
 
@@ -91,28 +89,28 @@ data Block = AssignmentBlock Assignment | Expression AExp | Conditional BExp
 
 controlFlowGraph :: Program -> CFG
 controlFlowGraph = flip evalState 0 . f
-  where
-    f :: S -> State Label CFG
-    f = \case
-      s1 ::: s2 -> do
-        label1 <- get
-        g1 <- f s1
-        label2 <- get
-        g2 <- f s2
-        pure $ g1 <> g2 <> makeGraph label1 [] [label2]
-      (Assignment a) -> do
-        label <- freshLabel
-        pure $ makeGraph label [AssignmentBlock a] []
-      (While condition body) -> do
-        label <- freshLabel
-        bodyGraph <- f body
-        lastBodyLabel <- gets (subtract 1)
-        let blocks = Map.singleton label (Conditional condition)
-        let edges = Map.fromList [(lastBodyLabel, [label]), (label, [label + 1])]
-        pure $ CFG blocks edges <> bodyGraph
+ where
+  f :: S -> State Label CFG
+  f = \case
+    s1 ::: s2 -> do
+      label1 <- get
+      g1 <- f s1
+      label2 <- get
+      g2 <- f s2
+      pure $ g1 <> g2 <> makeGraph label1 [] [label2]
+    (Assignment a) -> do
+      label <- freshLabel
+      pure $ makeGraph label [AssignmentBlock a] []
+    (While condition body) -> do
+      label <- freshLabel
+      bodyGraph <- f body
+      lastBodyLabel <- gets (subtract 1)
+      let blocks = Map.singleton label (Conditional condition)
+      let edges = Map.fromList [(lastBodyLabel, [label]), (label, [label + 1])]
+      pure $ CFG blocks edges <> bodyGraph
 
 freshLabel :: State Label Label
-freshLabel = state $ id &&& (+1) -- relude exports (&&&)
+freshLabel = state $ id &&& (+ 1) -- relude exports (&&&)
 
 --- Worklist Algorithm ---
 
@@ -129,16 +127,16 @@ occursInB _ = Set.empty
 
 identifiers :: CFG -> Set Identifier
 identifiers = foldMap f . _blocks
-  where
-    f (AssignmentBlock (x := y)) = Set.singleton x <> fa y
-    f (Expression a) = fa a
-    f (Conditional bexp) = fb bexp
-    fa (Variable x) = Set.singleton x
-    fa (BinaryArithmetic _ x y) = fa x <> fa y
-    fa _ = Set.empty
-    fb (Not e) = fb e
-    fb (BinaryBoolean _ x y) = fb x <> fb y
-    fb (BinaryRelational _ x y) = fa x <> fa y
+ where
+  f (AssignmentBlock (x := y)) = Set.singleton x <> fa y
+  f (Expression a) = fa a
+  f (Conditional bexp) = fb bexp
+  fa (Variable x) = Set.singleton x
+  fa (BinaryArithmetic _ x y) = fa x <> fa y
+  fa _ = Set.empty
+  fb (Not e) = fb e
+  fb (BinaryBoolean _ x y) = fb x <> fb y
+  fb (BinaryRelational _ x y) = fa x <> fa y
 
 uses :: Block -> Set Identifier
 uses (AssignmentBlock (_ := a)) = occursIn a
@@ -150,58 +148,59 @@ defines (AssignmentBlock (x := _)) = Set.singleton x
 defines _ = Set.empty
 
 data Analysis
- = ReachableDefinition
- | LiveVariable
- | VeryBusy
- | AvailableExpr
- deriving (Show, Eq, Ord, Bounded, Enum)
+  = ReachableDefinition
+  | LiveVariable
+  | VeryBusy
+  | AvailableExpr
+  deriving (Show, Eq, Ord, Bounded, Enum)
 
-data MonotoneFramework a = MF
- { extremal :: CFG -> Set Label
- , init :: CFG -> Set a
- , bottom :: Set a
- , transfer :: CFG -> Set a -> Label -> Set a
- , test :: Set a -> Set a -> Bool
- , join :: Set a -> Set a -> Set a
- }
+class MonotoneFramework a where
+  initialMap :: CFG -> LabelMap a
+  initial :: CFG -> Set a
+  bottom :: Set a
+  transfer :: CFG -> Set a -> Label -> Set a
+  test :: Set a -> Set a -> Bool
+  latticeJoin :: Set a -> Set a -> Set a
 
 type RDEntry = (Identifier, Maybe Label)
 
 rdTransfer :: CFG -> Set RDEntry -> Label -> Set RDEntry
 rdTransfer cfg old l = gen <> (old Set.\\ kill)
-  where Just block = Map.lookup l $ _blocks cfg
-        gen = Set.map (,Just l) $ defines block
-        kill = Set.filter ((`Set.member` killSet) . fst) old
-          where killSet = defines block
+ where
+  Just block = Map.lookup l $ _blocks cfg
+  gen = Set.map (,Just l) $ defines block
+  kill = Set.filter ((`Set.member` killSet) . fst) old
+   where
+    killSet = defines block
 
-rd :: MonotoneFramework RDEntry
-rd = MF
-  { extremal = const (Set.singleton 0)
-  , init = Set.map (,Nothing) . identifiers
-  , bottom = Set.empty
-  , test = Set.isSubsetOf
-  , join = Set.union
-  , transfer = rdTransfer
-  }
+data Dir = Forward | Backward
+  deriving Show
+
+instance MonotoneFramework RDEntry where
+  initialMap cfg = Map.fromList [(0, initial cfg)]
+  initial = Set.map (,Nothing) . identifiers
+  bottom = Set.empty
+  test = Set.isSubsetOf
+  latticeJoin = Set.union
+  transfer = rdTransfer
 
 -- RD : a = Set (Identifier, Label)
 
-worklist :: Ord a => MonotoneFramework a -> CFG -> LabelMap a
-worklist MF{..} cfg = go (allEdges cfg) initialMap
-  where
-    initialMap = Map.singleton 0 (init cfg)
-    go [] !output = output
-    go ((l, l') : rest) !output =
-      let ana_pre = Map.lookup l output ?: bottom
-          ana_post = Map.lookup l' output ?: bottom
-          new = transfer cfg ana_pre l
-          newset = join new ana_post
-       in if test new ana_post
-             then go rest output
-             else let output' = Map.insert l' newset output
-                      edges = filter ((== l') . fst) $ allEdges cfg
-                   in go (edges ++ rest) output'
-
+worklist :: (MonotoneFramework a, Ord a) => CFG -> LabelMap a
+worklist cfg = go (allEdges cfg) (initialMap cfg)
+ where
+  go [] !output = output
+  go ((l, l') : rest) !output =
+    let ana_pre = Map.lookup l output ?: bottom
+        ana_post = Map.lookup l' output ?: bottom
+        new = transfer cfg ana_pre l
+        newset = latticeJoin new ana_post
+     in if test new ana_post
+          then go rest output
+          else
+            let output' = Map.insert l' newset output
+                edges = filter ((== l') . fst) $ allEdges cfg
+             in go (edges ++ rest) output'
 
 --- Main ---
 
@@ -220,8 +219,7 @@ factorial =
 main :: IO ()
 main = do
   let cfg = controlFlowGraph factorial
-      reaching = rd
-  mapM_ print $ Map.toList . Map.map Set.toList $ worklist reaching cfg
+  mapM_ print $ Map.toList . Map.map Set.toList $ (worklist cfg :: LabelMap RDEntry)
 
 -- spec :: Spec
 -- spec = do
